@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Flydigi Vader 5 Pro
+Comment=Configure the active controller profile
+Comment[ru]=Настройка активного профиля геймпада
+Exec=vader5
+Icon=input-gaming
+StartupWMClass=vader5
+Terminal=false
+Categories=Settings;HardwareSettings;

@@ -1,0 +1,13 @@
+[package]
+name = "vader5"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+
+[dependencies]
+eframe = { version = "=0.31.1", default-features = false, features = ["glow", "default_fonts", "accesskit"] }
+hidapi = "2.6"
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+eframe = { version = "=0.31.1", default-features = false, features = ["x11", "wayland"] }

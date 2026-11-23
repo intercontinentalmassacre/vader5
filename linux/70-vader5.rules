@@ -1,0 +1,3 @@
+# Match the controller and its vendor configuration interface on separate ancestors.
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="37d7", ATTRS{idProduct}=="2401", ENV{.VADER5}="1"
+SUBSYSTEM=="hidraw", ENV{.VADER5}=="1", ATTRS{bInterfaceNumber}=="01", TAG+="uaccess"

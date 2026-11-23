@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 2,
+  "title": "Vader 5 Pro",
+  "extensions": {
+    "colorMeta": {
+      "primary": { "role": "primary", "displayName": "Изменения и запись" }
+    }
+  },
+  "components": [
+    {
+      "name": "Запись профиля",
+      "kind": "button",
+      "refersTo": "button-primary",
+      "description": "Доступна после правок в активном профиле.",
+      "html": "<button type='button'>Записать в геймпад</button>",
+      "css": "button { background: #B9E881; color: #171C1B; padding: 5px 12px; border: 0; border-radius: 3px; }"
+    }
+  ],
+  "narrative": {
+    "overview": "В таблице показаны реальные назначения геймпада. Строки с правками отмечены цветом и знаком."
+  }
+}

@@ -1005,6 +1005,10 @@ fn main() -> eframe::Result {
     }
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
+            .with_icon(
+                eframe::icon_data::from_png_bytes(include_bytes!("../assets/vader5.png"))
+                    .expect("embedded application icon"),
+            )
             .with_app_id("vader5")
             .with_inner_size([1020., 720.])
             .with_min_inner_size([560., 440.]),

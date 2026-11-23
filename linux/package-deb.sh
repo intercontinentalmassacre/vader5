@@ -11,6 +11,7 @@ tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 install -Dm755 "$binary" "$tmp/pkg/usr/bin/vader5"
 strip "$tmp/pkg/usr/bin/vader5"
+install -Dm644 assets/vader5.png "$tmp/pkg/usr/share/icons/hicolor/256x256/apps/vader5.png"
 install -Dm644 linux/vader5.desktop "$tmp/pkg/usr/share/applications/vader5.desktop"
 install -Dm644 linux/70-vader5.rules "$tmp/pkg/usr/lib/udev/rules.d/70-vader5.rules"
 mkdir -p "$tmp/debian" "$tmp/pkg/DEBIAN"

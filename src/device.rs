@@ -244,6 +244,9 @@ impl Pad {
             ));
         }
         let lights = self.blob(0xa7, slot)?;
+        if self.active()? != (slot, revision) {
+            return Err("Активный профиль изменился во время чтения. Повторите чтение.".into());
+        }
         Ok(Profile {
             path: self.path.clone(),
             lights,
@@ -331,8 +334,8 @@ pub fn save(
             pad.exchange(cmd, p).map(|_| ())
         })?;
     }
-    if pad.active()?.0 != current.slot {
-        return Err("Активный профиль сменился во время записи. Считайте профиль заново.".into());
+    if pad.active()? != (current.slot, current.revision) {
+        return Err("Активный профиль изменился во время записи. Считайте профиль заново.".into());
     }
     if lighting_changed {
         // AA commits the running configuration and signals the LED coprocessor.
@@ -501,6 +504,7 @@ mod tests {
             })?;
         }
         let after = pad.profile()?;
+        assert_eq!((after.slot, after.revision), (before.slot, before.revision));
         assert_eq!(after.bytes, before.bytes);
         assert_eq!(after.lights, before.lights);
         Ok(())

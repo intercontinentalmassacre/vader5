@@ -215,9 +215,6 @@ impl Editor {
             if !self.online() {
                 if dirty {
                     self.monitor.take();
-                    self.message =
-                        "Геймпад отключён. Подключите его снова или отмените правки.".into();
-                    self.error = true;
                     return;
                 }
                 self.selected = None;
@@ -225,7 +222,7 @@ impl Editor {
                 self.monitor.take();
                 self.error = false;
                 self.message = if self.devices.is_empty() {
-                    "Поиск геймпадов…"
+                    "Геймпад не найден"
                 } else {
                     "Выберите геймпад"
                 }
@@ -240,11 +237,12 @@ impl Editor {
                         || self.monitor.as_ref().is_some_and(Monitor::finished))
                 {
                     self.run(ctx, false);
-                } else if dirty && self.monitor.as_ref().is_none_or(Monitor::finished) {
-                    if let Some(p) = &self.profile {
-                        self.monitor = Some(Monitor::start(p));
-                        self.next_retry = Instant::now() + Duration::from_secs(8);
-                    }
+                } else if dirty
+                    && self.monitor.as_ref().is_none_or(Monitor::finished)
+                    && let Some(p) = &self.profile
+                {
+                    self.monitor = Some(Monitor::start(p));
+                    self.next_retry = Instant::now() + Duration::from_secs(8);
                 }
             }
         } else if Instant::now() >= self.next_scan {
@@ -398,7 +396,13 @@ impl eframe::App for Editor {
                     .inner_margin(16),
             )
             .show(ctx, |ui| {
-                if self.error {
+                if dirty && !self.online() {
+                    ui.colored_label(
+                        Color32::from_rgb(255, 182, 150),
+                        "Геймпад отключён. Подключите его снова или отмените правки.",
+                    );
+                    ui.add_space(6.);
+                } else if self.error {
                     ui.colored_label(Color32::from_rgb(255, 182, 150), &self.message);
                     ui.add_space(6.);
                 }
@@ -423,7 +427,9 @@ impl eframe::App for Editor {
                     } else {
                         self.message.clone()
                     };
-                    ui.label(RichText::new(status).color(MUTED));
+                    if !status.is_empty() {
+                        ui.label(RichText::new(status).color(MUTED));
+                    }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let active = dirty && !busy && self.online();
                         let mut apply = egui::Button::new(
@@ -479,30 +485,37 @@ impl eframe::App for Editor {
         egui::CentralPanel::default()
             .frame(Frame::new().fill(BG).inner_margin(22))
             .show(ctx, |ui| {
-                if self.devices.len() > 1 || (dirty && !self.online() && !self.devices.is_empty()) {
+                if !self.devices.is_empty() {
                     let mut picked = self.selected.clone();
-                    ui.add_enabled_ui(!busy && !dirty, |ui| {
-                        egui::ComboBox::from_label("Геймпад")
-                            .selected_text(
-                                self.devices
-                                    .iter()
-                                    .find(|d| Some(&d.path) == picked.as_ref())
-                                    .map_or("Выберите устройство", |d| {
-                                        d.label.as_str()
-                                    }),
-                            )
-                            .show_ui(ui, |ui| {
-                                for d in &self.devices {
-                                    ui.selectable_value(
-                                        &mut picked,
-                                        Some(d.path.clone()),
-                                        &d.label,
-                                    );
-                                }
-                            });
-                    })
-                    .response
-                    .on_disabled_hover_text("Сначала запишите или отмените изменения.");
+                    let selected_label = self
+                        .devices
+                        .iter()
+                        .find(|d| Some(&d.path) == picked.as_ref())
+                        .map(|d| d.label.as_str());
+                    if self.devices.len() == 1
+                        && let Some(label) = selected_label
+                    {
+                        ui.label(label);
+                    } else {
+                        let selector = ui.add_enabled_ui(!busy && !dirty, |ui| {
+                            egui::ComboBox::from_id_salt("controller")
+                                .selected_text(selected_label.unwrap_or("Выберите геймпад"))
+                                .show_ui(ui, |ui| {
+                                    for d in &self.devices {
+                                        ui.selectable_value(
+                                            &mut picked,
+                                            Some(d.path.clone()),
+                                            &d.label,
+                                        );
+                                    }
+                                });
+                        });
+                        if dirty {
+                            selector
+                                .response
+                                .on_disabled_hover_text("Сначала запишите или отмените изменения.");
+                        }
+                    }
                     if picked != self.selected {
                         self.selected = picked;
                         self.profile = None;
@@ -510,7 +523,7 @@ impl eframe::App for Editor {
                         busy = true;
                     }
                 }
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     if !wide {
                         navigation(ui, &mut self.tab, false);
                     }
@@ -519,22 +532,21 @@ impl eframe::App for Editor {
                         ui.separator();
                         battery_indicator(ui, input.battery);
                     }
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui
+                    if self.online()
+                        && ui
                             .add_enabled(
-                                !busy && !dirty && self.online(),
+                                !busy && !dirty,
                                 egui::Button::new(if self.profile.is_some() {
                                     "Перечитать профиль"
                                 } else {
-                                    "Подключить геймпад"
+                                    "Прочитать профиль"
                                 }),
                             )
                             .on_hover_text("Загрузить активный профиль геймпада (F5)")
                             .clicked()
-                        {
-                            self.run(ctx, false);
-                        }
-                    });
+                    {
+                        self.run(ctx, false);
+                    }
                 });
                 ui.separator();
                 ui.add_space(10.);
@@ -696,10 +708,10 @@ impl eframe::App for Editor {
                                 }
                             }
                         });
-                } else if busy {
-                    ui.label("Читаем назначения с геймпада…");
-                } else {
+                } else if !busy && self.devices.is_empty() {
                     ui.label("Подключите геймпад кабелем или через USB-приёмник в режиме XInput.");
+                } else if !busy && self.selected.is_none() {
+                    ui.label("Выберите геймпад, чтобы загрузить его активный профиль.");
                 }
             });
         if busy && ctx.input(|input| input.viewport().close_requested()) {
@@ -1046,6 +1058,10 @@ mod tests {
         scan(&mut editor, vec![a.clone()], true);
         assert_eq!(editor.selected.as_ref(), Some(&b.path));
         assert!(!editor.online() && editor.work.is_none());
+        assert!(
+            !editor.error,
+            "disconnect must not set a profile operation error"
+        );
         assert_eq!(editor.draft[123], 42);
         editor.next_retry = std::time::Instant::now() + std::time::Duration::from_secs(8);
         scan(&mut editor, vec![b.clone(), a], true);

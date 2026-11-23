@@ -115,6 +115,10 @@ fn identify(b: &[u8; 320]) -> Option<Effect> {
     effect.write(&mut expected, base_color(b));
     (expected == *b).then_some(effect)
 }
+fn preview_phase(seconds: f64, speed_byte: u8) -> f64 {
+    seconds / (0.025 * f64::from(speed_byte.max(1)))
+}
+
 fn preview(ui: &mut egui::Ui, b: &[u8; 320]) {
     let (rect, _) =
         ui.allocate_exact_size(egui::vec2(ui.available_width(), 74.), egui::Sense::hover());
@@ -123,7 +127,7 @@ fn preview(ui: &mut egui::Ui, b: &[u8; 320]) {
     let start = usize::from(b[3].min(9));
     let last = usize::from(b[4].min(9)).max(start);
     let count = last - start + 1;
-    let tick = ui.input(|i| i.time) / (0.025 * f64::from(b[5].max(1))).max(0.08);
+    let tick = preview_phase(ui.input(|i| i.time), b[5]);
     let index = tick as usize % count;
     let fraction = tick.fract() as f32;
     let bar = rect.shrink2(egui::vec2(18., 23.));
@@ -142,7 +146,9 @@ fn preview(ui: &mut egui::Ui, b: &[u8; 320]) {
         painter.rect_filled(r, 3., Color32::from_rgb(rgb[0], rgb[1], rgb[2]));
     }
     if count > 1 && b[6] > 0 {
-        ui.ctx().request_repaint_after(Duration::from_millis(33));
+        let refresh_ms = (u64::from(b[5].max(1)) * 25 / 2).clamp(16, 33);
+        ui.ctx()
+            .request_repaint_after(Duration::from_millis(refresh_ms));
     }
 }
 pub fn show(ui: &mut egui::Ui, draft: &mut [u8; 320], original: &[u8; 320]) {
@@ -344,6 +350,13 @@ fn controls(ui: &mut egui::Ui, draft: &mut [u8; 320], original: &[u8; 320]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn each_speed_advances_the_preview_faster() {
+        for pair in SPEED.windows(2) {
+            assert!(preview_phase(1., pair[0]) < preview_phase(1., pair[1]));
+        }
+        assert_eq!(preview_phase(1., 0), preview_phase(1., 1));
+    }
     #[test]
     #[ignore = "requires a controller; saves a temporary animation then restores the original"]
     fn hardware_animation_save_and_restore() -> Result<(), String> {

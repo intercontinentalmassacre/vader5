@@ -16,7 +16,8 @@ install -Dm644 linux/vader5.desktop "$tmp/pkg/usr/share/applications/vader5.desk
 install -Dm644 linux/70-vader5.rules "$tmp/pkg/usr/lib/udev/rules.d/70-vader5.rules"
 mkdir -p "$tmp/debian" "$tmp/pkg/DEBIAN"
 printf 'Source: vader5\n' > "$tmp/debian/control"
-deps=$(cd "$tmp" && dpkg-shlibdeps -O -e"pkg/usr/bin/vader5" | sed 's/^shlibs:Depends=//')
+deps=$(cd "$tmp" && dpkg-shlibdeps -O -e"pkg/usr/bin/vader5")
+deps=${deps#shlibs:Depends=}
 cat > "$tmp/pkg/DEBIAN/control" <<EOF
 Package: vader5
 Version: $version

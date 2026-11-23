@@ -100,6 +100,11 @@ fn binding(bytes: &[u8; 840], key: usize) -> String {
 
 type Reply = Result<device::Profile, String>;
 struct Editor {
+    devices: Vec<device::Controller>,
+    selected: Option<std::ffi::CString>,
+    scan: Option<mpsc::Receiver<Result<Vec<device::Controller>, String>>>,
+    next_scan: std::time::Instant,
+    next_retry: std::time::Instant,
     profile: Option<Arc<device::Profile>>,
     draft: [u8; 840],
     work: Option<mpsc::Receiver<Reply>>,
@@ -142,8 +147,7 @@ fn desktop_font(ctx: &egui::Context) {
 }
 
 impl Editor {
-    fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        let ctx = &cc.egui_ctx;
+    fn new(ctx: &egui::Context) -> Self {
         desktop_font(ctx);
         let mut style = (*ctx.style()).clone();
         style.visuals = egui::Visuals::dark();
@@ -163,7 +167,12 @@ impl Editor {
             .insert(egui::TextStyle::Button, egui::FontId::proportional(15.));
         style.visuals.widgets.inactive.weak_bg_fill = Color32::from_rgb(44, 52, 48);
         ctx.set_style(style);
-        let mut editor = Self {
+        Self {
+            devices: Vec::new(),
+            selected: None,
+            scan: None,
+            next_scan: std::time::Instant::now(),
+            next_retry: std::time::Instant::now(),
             profile: None,
             draft: [0; 840],
             work: None,
@@ -175,14 +184,91 @@ impl Editor {
             monitor: None,
             gyro_test: Default::default(),
             map: silhouettes::Map::new(ctx),
-            message: String::new(),
+            message: "Поиск геймпадов…".into(),
             error: false,
-        };
-        editor.run(ctx, false);
-        editor
+        }
+    }
+
+    fn discover(&mut self, ctx: &egui::Context, dirty: bool) {
+        use std::time::{Duration, Instant};
+        ctx.request_repaint_after(Duration::from_secs(2));
+        if self.work.is_some() {
+            return;
+        }
+        if let Some(rx) = &self.scan {
+            let result = match rx.try_recv() {
+                Ok(list) => list,
+                Err(mpsc::TryRecvError::Empty) => return,
+                Err(mpsc::TryRecvError::Disconnected) => Err("Поиск геймпадов прерван.".into()),
+            };
+            self.scan = None;
+            self.next_scan = Instant::now() + Duration::from_secs(2);
+            let devices = match result {
+                Ok(devices) => devices,
+                Err(e) => {
+                    self.message = e;
+                    self.error = true;
+                    return;
+                }
+            };
+            self.devices = devices;
+            if !self.online() {
+                if dirty {
+                    self.monitor.take();
+                    self.message =
+                        "Геймпад отключён. Подключите его снова или отмените правки.".into();
+                    self.error = true;
+                    return;
+                }
+                self.selected = None;
+                self.profile = None;
+                self.monitor.take();
+                self.error = false;
+                self.message = if self.devices.is_empty() {
+                    "Поиск геймпадов…"
+                } else {
+                    "Выберите геймпад"
+                }
+                .into();
+                if let [only] = self.devices.as_slice() {
+                    self.selected = Some(only.path.clone());
+                    self.run(ctx, false);
+                }
+            } else if Instant::now() >= self.next_retry {
+                if !dirty
+                    && (self.profile.is_none()
+                        || self.monitor.as_ref().is_some_and(Monitor::finished))
+                {
+                    self.run(ctx, false);
+                } else if dirty && self.monitor.as_ref().is_none_or(Monitor::finished) {
+                    if let Some(p) = &self.profile {
+                        self.monitor = Some(Monitor::start(p));
+                        self.next_retry = Instant::now() + Duration::from_secs(8);
+                    }
+                }
+            }
+        } else if Instant::now() >= self.next_scan {
+            let (tx, rx) = mpsc::channel();
+            self.scan = Some(rx);
+            let ctx = ctx.clone();
+            std::thread::spawn(move || {
+                let _ = tx.send(device::discover());
+                ctx.request_repaint();
+            });
+        }
+    }
+
+    fn online(&self) -> bool {
+        self.devices
+            .iter()
+            .any(|d| Some(&d.path) == self.selected.as_ref())
     }
 
     fn run(&mut self, ctx: &egui::Context, save: bool) {
+        let Some(path) = self.selected.clone() else {
+            return;
+        };
+        self.next_retry = std::time::Instant::now() + std::time::Duration::from_secs(8);
         self.gyro_test = Default::default();
         let current = self.profile.clone();
         let draft = self.draft;
@@ -207,7 +293,7 @@ impl Editor {
                     .ok_or_else(|| "Сначала прочитайте профиль".to_string())
                     .and_then(|p| device::save(&p, &draft, &lights, retry))
             } else {
-                device::load()
+                device::load_at(&path)
             };
             let _ = tx.send(result);
             ctx.request_repaint();
@@ -228,8 +314,8 @@ impl Editor {
             Ok(p) => {
                 self.draft = p.bytes;
                 self.lights = p.lights;
+                self.monitor = Some(Monitor::start(&p));
                 self.profile = Some(Arc::new(p));
-                self.monitor = Some(Monitor::start());
                 self.message = if self.saving {
                     "Запись проверена"
                 } else {
@@ -241,7 +327,7 @@ impl Editor {
                 self.message = e;
                 self.error = true;
                 if self.saving {
-                    self.monitor = Some(Monitor::start());
+                    self.monitor = self.profile.as_ref().map(|p| Monitor::start(p));
                 } else {
                     self.profile = None;
                 }
@@ -253,7 +339,7 @@ impl Editor {
 impl eframe::App for Editor {
     fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
         self.poll();
-        let mut busy = self.work.is_some();
+
         let changed = self
             .profile
             .as_ref()
@@ -275,7 +361,9 @@ impl eframe::App for Editor {
             p.bytes[109..183] != self.draft[109..183] || p.bytes[790..814] != self.draft[790..814]
         });
         let dirty = changed > 0 || light_dirty || tuning_dirty;
-        if !busy {
+        self.discover(ctx, dirty);
+        let mut busy = self.work.is_some();
+        if !busy && self.online() {
             if dirty && ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::S)) {
                 self.run(ctx, true);
                 busy = true;
@@ -337,7 +425,7 @@ impl eframe::App for Editor {
                     };
                     ui.label(RichText::new(status).color(MUTED));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let active = dirty && !busy;
+                        let active = dirty && !busy && self.online();
                         let mut apply = egui::Button::new(
                             RichText::new("Записать в геймпад").color(if active {
                                 BG
@@ -358,7 +446,7 @@ impl eframe::App for Editor {
                         }
                         if dirty
                             && ui
-                                .add_enabled(active, egui::Button::new("Отменить"))
+                                .add_enabled(!busy, egui::Button::new("Отменить"))
                                 .clicked()
                         {
                             if let Some(p) = &self.profile {
@@ -391,49 +479,137 @@ impl eframe::App for Editor {
         egui::CentralPanel::default()
             .frame(Frame::new().fill(BG).inner_margin(22))
             .show(ctx, |ui| {
-                ui.horizontal(|ui|{
-                    if !wide {navigation(ui,&mut self.tab,false);}
-                    if let Some(profile)=&self.profile{
-                        ui.label(RichText::new(format!("Профиль {}",profile.slot+1)).strong());
+                if self.devices.len() > 1 || (dirty && !self.online() && !self.devices.is_empty()) {
+                    let mut picked = self.selected.clone();
+                    ui.add_enabled_ui(!busy && !dirty, |ui| {
+                        egui::ComboBox::from_label("Геймпад")
+                            .selected_text(
+                                self.devices
+                                    .iter()
+                                    .find(|d| Some(&d.path) == picked.as_ref())
+                                    .map_or("Выберите устройство", |d| {
+                                        d.label.as_str()
+                                    }),
+                            )
+                            .show_ui(ui, |ui| {
+                                for d in &self.devices {
+                                    ui.selectable_value(
+                                        &mut picked,
+                                        Some(d.path.clone()),
+                                        &d.label,
+                                    );
+                                }
+                            });
+                    })
+                    .response
+                    .on_disabled_hover_text("Сначала запишите или отмените изменения.");
+                    if picked != self.selected {
+                        self.selected = picked;
+                        self.profile = None;
+                        self.run(ctx, false);
+                        busy = true;
+                    }
+                }
+                ui.horizontal(|ui| {
+                    if !wide {
+                        navigation(ui, &mut self.tab, false);
+                    }
+                    if let Some(profile) = &self.profile {
+                        ui.label(RichText::new(format!("Профиль {}", profile.slot + 1)).strong());
                         ui.separator();
                         battery_indicator(ui, input.battery);
                     }
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center),|ui|{
-                        if ui.add_enabled(!busy && !dirty,egui::Button::new(if self.profile.is_some() {"Перечитать профиль"} else {"Подключить геймпад"}))
-                            .on_hover_text("Загрузить активный профиль геймпада (F5)").clicked(){self.run(ctx,false);}
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .add_enabled(
+                                !busy && !dirty && self.online(),
+                                egui::Button::new(if self.profile.is_some() {
+                                    "Перечитать профиль"
+                                } else {
+                                    "Подключить геймпад"
+                                }),
+                            )
+                            .on_hover_text("Загрузить активный профиль геймпада (F5)")
+                            .clicked()
+                        {
+                            self.run(ctx, false);
+                        }
                     });
                 });
-                ui.separator();ui.add_space(10.);
+                ui.separator();
+                ui.add_space(10.);
                 ui.heading(RichText::new(self.tab.title()).size(26.));
                 ui.add_space(12.);
-                let monitor=self.monitor.as_ref().filter(|_|matches!(&live,Some(Ok(_))));
-                if self.tab!=Tab::Map && let Some(Err(e))=&live {ui.colored_label(MUTED,e);}
-                if matches!(self.tab,Tab::Zones|Tab::Gyro|Tab::Vibration) {
-                    if let Some(profile)=&self.profile{
-                        egui::ScrollArea::vertical().show(ui,|ui|ui.add_enabled_ui(!busy,|ui|{
-                            if self.tab==Tab::Zones{tuning::zones(ui,&mut self.draft,&profile.bytes,live.as_ref().and_then(|v|v.as_ref().ok()));}
-                            else if self.tab==Tab::Gyro{
-                                tuning::gyro(ui,&mut self.draft,live.as_ref().and_then(|r|r.as_ref().ok()).map(|i|i.gyro),&mut self.gyro_test);
-                            }else{tuning::vibration(ui,&mut self.draft,monitor);}
-                        }));
-                    }else{ui.label("Для настройки прочитайте профиль геймпада.");}
-                    return;
+                let monitor = self
+                    .monitor
+                    .as_ref()
+                    .filter(|_| matches!(&live, Some(Ok(_))));
+                if self.tab != Tab::Map
+                    && let Some(Err(e)) = &live
+                {
+                    ui.colored_label(MUTED, e);
                 }
-                if self.tab==Tab::Lights {
-                    if let Some(p)=&self.profile {egui::ScrollArea::vertical().show(ui,|ui|ui.add_enabled_ui(!busy,|ui|lighting::show(ui,&mut self.lights,&p.lights)));}
-                    else {ui.label("Для настройки подсветки прочитайте профиль.");}
-                    return;
-                }
-                if self.tab==Tab::Map {
-                    match &live {
-                        Some(Ok(i))=>{ui.label(live_label(i));},
-                        Some(Err(e))=>{ui.colored_label(MUTED,e);}, None=>{}
+                if matches!(self.tab, Tab::Zones | Tab::Gyro | Tab::Vibration) {
+                    if let Some(profile) = &self.profile {
+                        egui::ScrollArea::vertical().show(ui, |ui| {
+                            ui.add_enabled_ui(!busy, |ui| {
+                                if self.tab == Tab::Zones {
+                                    tuning::zones(
+                                        ui,
+                                        &mut self.draft,
+                                        &profile.bytes,
+                                        live.as_ref().and_then(|v| v.as_ref().ok()),
+                                    );
+                                } else if self.tab == Tab::Gyro {
+                                    tuning::gyro(
+                                        ui,
+                                        &mut self.draft,
+                                        live.as_ref().and_then(|r| r.as_ref().ok()).map(|i| i.gyro),
+                                        &mut self.gyro_test,
+                                    );
+                                } else {
+                                    tuning::vibration(ui, &mut self.draft, monitor);
+                                }
+                            })
+                        });
+                    } else {
+                        ui.label("Для настройки прочитайте профиль геймпада.");
                     }
-                    self.map.input=input;
-                    let map_height = (ui.available_height()-100.).clamp(270., 440.);
+                    return;
+                }
+                if self.tab == Tab::Lights {
+                    if let Some(p) = &self.profile {
+                        egui::ScrollArea::vertical().show(ui, |ui| {
+                            ui.add_enabled_ui(!busy, |ui| {
+                                lighting::show(ui, &mut self.lights, &p.lights)
+                            })
+                        });
+                    } else {
+                        ui.label("Для настройки подсветки прочитайте профиль.");
+                    }
+                    return;
+                }
+                if self.tab == Tab::Map {
+                    match &live {
+                        Some(Ok(i)) => {
+                            ui.label(live_label(i));
+                        }
+                        Some(Err(e)) => {
+                            ui.colored_label(MUTED, e);
+                        }
+                        None => {}
+                    }
+                    self.map.input = input;
+                    let map_height = (ui.available_height() - 100.).clamp(270., 440.);
                     egui::ScrollArea::vertical().show(ui, |ui| {
-                        let loaded=self.profile.is_some();
-                        self.map.show(ui,&mut self.draft,loaded && !busy,self.profile.as_ref().map(|p| &p.bytes),map_height);
+                        let loaded = self.profile.is_some();
+                        self.map.show(
+                            ui,
+                            &mut self.draft,
+                            loaded && !busy,
+                            self.profile.as_ref().map(|p| &p.bytes),
+                            map_height,
+                        );
                     });
                     return;
                 }
@@ -443,64 +619,87 @@ impl eframe::App for Editor {
                 });
                 ui.add_space(15.);
                 if let Some(profile) = &self.profile {
-                    egui::ScrollArea::vertical().id_salt(("bindings", self.standard)).auto_shrink([false, false]).show_viewport(ui, |ui, viewport| {
-                        let visible = viewport.translate(ui.min_rect().min.to_vec2());
-                        if self.standard {
-                            let mut group = |ui: &mut egui::Ui, title: &str, keys: &[usize]| {
-                                ui.label(RichText::new(title).size(18.).strong());
-                                for &key in keys {
-                                    let row = assignment_row(ui, key, &mut self.draft, &profile.bytes, !busy, &input);
-                                    if scroll_buttons & (1 << key) != 0
-                                        && (row.top() < visible.top() || row.bottom() > visible.bottom())
-                                        && !ui.memory(|m| m.any_popup_open()) {
-                                        ui.scroll_to_rect(row, None);
-                                        scroll_buttons = 0;
+                    egui::ScrollArea::vertical()
+                        .id_salt(("bindings", self.standard))
+                        .auto_shrink([false, false])
+                        .show_viewport(ui, |ui, viewport| {
+                            let visible = viewport.translate(ui.min_rect().min.to_vec2());
+                            if self.standard {
+                                let mut group = |ui: &mut egui::Ui, title: &str, keys: &[usize]| {
+                                    ui.label(RichText::new(title).size(18.).strong());
+                                    for &key in keys {
+                                        let row = assignment_row(
+                                            ui,
+                                            key,
+                                            &mut self.draft,
+                                            &profile.bytes,
+                                            !busy,
+                                            &input,
+                                        );
+                                        if scroll_buttons & (1 << key) != 0
+                                            && (row.top() < visible.top()
+                                                || row.bottom() > visible.bottom())
+                                            && !ui.memory(|m| m.any_popup_open())
+                                        {
+                                            ui.scroll_to_rect(row, None);
+                                            scroll_buttons = 0;
+                                        }
+                                    }
+                                };
+                                let groups: [(&str, &[usize]); 4] = [
+                                    ("Кнопки ABXY", &[4, 5, 7, 8]),
+                                    ("Бамперы и триггеры", &[10, 11, 12, 13]),
+                                    ("Крестовина", &[0, 1, 2, 3]),
+                                    ("Стики и меню", &[14, 15, 6, 9]),
+                                ];
+                                if ui.available_width() >= 680. {
+                                    for pair in groups.chunks_exact(2) {
+                                        ui.columns(2, |columns| {
+                                            for (column, &(title, keys)) in
+                                                columns.iter_mut().zip(pair)
+                                            {
+                                                group(column, title, keys);
+                                            }
+                                        });
+                                        ui.add_space(8.);
+                                    }
+                                } else {
+                                    for (title, keys) in groups {
+                                        group(ui, title, keys);
+                                        ui.add_space(8.);
                                     }
                                 }
-                            };
-                            let groups: [(&str, &[usize]); 4] = [
-                                ("Кнопки ABXY", &[4, 5, 7, 8]),
-                                ("Бамперы и триггеры", &[10, 11, 12, 13]),
-                                ("Крестовина", &[0, 1, 2, 3]),
-                                ("Стики и меню", &[14, 15, 6, 9]),
-                            ];
-                            if ui.available_width() >= 680. {
-                                for pair in groups.chunks_exact(2) {
-                                    ui.columns(2, |columns| {
-                                        for (column, &(title, keys)) in columns.iter_mut().zip(pair) {
-                                            group(column, title, keys);
-                                        }
-                                    });
-                                    ui.add_space(8.);
-                                }
                             } else {
-                                for (title, keys) in groups {
-                                    group(ui, title, keys);
-                                    ui.add_space(8.);
+                                ui.label(RichText::new("Задние лепестки").size(19.).strong());
+                                ui.add_space(4.);
+                                paddle_bindings(ui, &mut self.draft, &profile.bytes, !busy, &input);
+                                ui.add_space(16.);
+                                ui.label(RichText::new("Дополнительные кнопки").size(19.).strong());
+                                ui.add_space(4.);
+
+                                ui.horizontal(|ui| {
+                                    source_column(ui, 20., |ui| {
+                                        ui.colored_label(MUTED, "Кнопка");
+                                    });
+                                    ui.colored_label(MUTED, "Назначение");
+                                });
+                                for &key in &EXTRA[4..] {
+                                    ui.separator();
+                                    assignment_row(
+                                        ui,
+                                        key,
+                                        &mut self.draft,
+                                        &profile.bytes,
+                                        !busy,
+                                        &input,
+                                    );
                                 }
                             }
-                        } else {
-                            ui.label(RichText::new("Задние лепестки").size(19.).strong());
-                            ui.add_space(4.);
-                            paddle_bindings(ui, &mut self.draft, &profile.bytes, !busy, &input);
-                            ui.add_space(16.);
-                            ui.label(RichText::new("Дополнительные кнопки").size(19.).strong());
-                            ui.add_space(4.);
-
-                        ui.horizontal(|ui| {
-                            source_column(ui, 20., |ui| { ui.colored_label(MUTED, "Кнопка"); });
-                            ui.colored_label(MUTED, "Назначение");
                         });
-                        for &key in &EXTRA[4..] {
-                            ui.separator();
-                            assignment_row(ui, key, &mut self.draft, &profile.bytes, !busy, &input);
-                        }
-                        }
-                    });
                 } else if busy {
                     ui.label("Читаем назначения с геймпада…");
                 } else {
-                    ui.label("Подключите геймпад кабелем или через USB-приёмник и нажмите «Подключить геймпад».");
+                    ui.label("Подключите геймпад кабелем или через USB-приёмник в режиме XInput.");
                 }
             });
         if busy && ctx.input(|input| input.viewport().close_requested()) {
@@ -814,13 +1013,42 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "Flydigi Vader 5 Pro",
         options,
-        Box::new(|cc| Ok(Box::new(Editor::new(cc)))),
+        Box::new(|cc| Ok(Box::new(Editor::new(&cc.egui_ctx)))),
     )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn multiple_controllers_wait_for_selection_and_keep_dirty_target() {
+        let ctx = egui::Context::default();
+        let mut editor = Editor::new(&ctx);
+        let pad = |port: &str| device::Controller {
+            label: "Vader 5 Pro".into(),
+            path: std::ffi::CString::new(port).unwrap(),
+        };
+        let (a, b) = (pad("usb-A"), pad("usb-B"));
+        let scan = |editor: &mut Editor, devices, dirty| {
+            let (tx, rx) = mpsc::channel();
+            tx.send(Ok(devices)).unwrap();
+            editor.scan = Some(rx);
+            editor.discover(&ctx, dirty);
+        };
+        scan(&mut editor, vec![a.clone(), b.clone()], false);
+        assert!(editor.selected.is_none() && editor.work.is_none());
+        editor.selected = Some(b.path.clone());
+        editor.draft[123] = 42;
+        scan(&mut editor, vec![a.clone()], true);
+        assert_eq!(editor.selected.as_ref(), Some(&b.path));
+        assert!(!editor.online() && editor.work.is_none());
+        assert_eq!(editor.draft[123], 42);
+        editor.next_retry = std::time::Instant::now() + std::time::Duration::from_secs(8);
+        scan(&mut editor, vec![b.clone(), a], true);
+        assert!(editor.online());
+        assert_eq!(editor.selected, Some(b.path));
+    }
+
     #[test]
     fn displays_special_bindings_without_rewriting_them() {
         let mut bytes = [0; 840];

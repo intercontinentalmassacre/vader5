@@ -119,14 +119,16 @@ pub struct Monitor {
     thread: Option<JoinHandle<()>>,
 }
 impl Monitor {
-    pub fn start() -> Self {
+    pub fn start(profile: &super::Profile) -> Self {
+        let path = profile.path.clone();
+        let uid = profile.uid;
         let state = Arc::new(Mutex::new(Err("Подключение ввода…".into())));
         let stop = Arc::new(AtomicBool::new(false));
         let pulse = Arc::new(Mutex::new(Pulse::Idle));
         let worker_pulse = pulse.clone();
         let (shared, quit) = (state.clone(), stop.clone());
         let thread = thread::spawn(move || {
-            if let Err(e) = stream(&shared, &quit, &worker_pulse) {
+            if let Err(e) = stream(&path, uid, &shared, &quit, &worker_pulse) {
                 *shared.lock().unwrap() = Err(e);
                 *worker_pulse.lock().unwrap() = Pulse::Idle;
             }
@@ -138,6 +140,10 @@ impl Monitor {
             thread: Some(thread),
         }
     }
+    pub fn finished(&self) -> bool {
+        self.thread.as_ref().is_none_or(|t| t.is_finished())
+    }
+
     pub fn test(&self, motor: Motor) {
         if self.state().is_ok() {
             let mut p = self.pulse.lock().unwrap();
@@ -168,8 +174,17 @@ impl Drop for Monitor {
         }
     }
 }
-fn stream(shared: &Mutex<Result<Input>>, stop: &AtomicBool, pulse: &Mutex<Pulse>) -> Result<()> {
-    let pad = Pad::open()?;
+fn stream(
+    path: &std::ffi::CStr,
+    uid: [u8; 13],
+    shared: &Mutex<Result<Input>>,
+    stop: &AtomicBool,
+    pulse: &Mutex<Pulse>,
+) -> Result<()> {
+    let pad = Pad::open(path)?;
+    if pad.uid != uid {
+        return Err("Геймпад изменился. Перечитайте профиль.".into());
+    }
     let status = pad.exchange(0x10, &[])?;
     if status[6] > 1 {
         return Err("Неизвестный режим потока ввода.".into());
@@ -294,8 +309,11 @@ mod tests {
     #[test]
     #[ignore = "requires a connected Vader 5 Pro"]
     fn live_device_stream_restores_flags() {
-        let before = Pad::open().unwrap().exchange(0x10, &[]).unwrap();
-        let monitor = Monitor::start();
+        let before = Pad::open(&super::super::single().unwrap())
+            .unwrap()
+            .exchange(0x10, &[])
+            .unwrap();
+        let monitor = Monitor::start(&super::super::load().unwrap());
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             if monitor.state().is_ok() {
@@ -305,14 +323,17 @@ mod tests {
             thread::sleep(Duration::from_millis(20));
         }
         drop(monitor);
-        let after = Pad::open().unwrap().exchange(0x10, &[]).unwrap();
+        let after = Pad::open(&super::super::single().unwrap())
+            .unwrap()
+            .exchange(0x10, &[])
+            .unwrap();
         assert_eq!(before[5..10], after[5..10]);
     }
     #[test]
     #[ignore = "requires a physical controller; pulses all four motors"]
     fn live_motor_tests_stop() {
         let before = super::super::load().unwrap();
-        let m = Monitor::start();
+        let m = Monitor::start(&super::super::load().unwrap());
         let deadline = Instant::now() + Duration::from_secs(5);
         while m.state().is_err() {
             assert!(Instant::now() < deadline, "{:?}", m.state().err());

@@ -11,7 +11,51 @@ type Reply = [u8; 32];
 type Result<T> = std::result::Result<T, String>;
 
 pub mod monitor;
+use std::ffi::{CStr, CString};
+
+#[derive(Clone, PartialEq, Debug)]
+pub struct Controller {
+    pub path: CString,
+    pub label: String,
+}
+
+pub fn discover() -> Result<Vec<Controller>> {
+    let api = HidApi::new().map_err(|e| e.to_string())?;
+    let mut pads = Vec::new();
+    for info in api
+        .device_list()
+        .filter(|d| d.vendor_id() == 0x37d7 && d.usage_page() == 0xffa0 && d.usage() == 1)
+    {
+        let path = info.path().to_owned();
+        let name = info
+            .product_string()
+            .filter(|s| !s.is_empty())
+            .unwrap_or("Flydigi");
+        // Include a port identifier even when two receivers report the same serial.
+        let id = path.to_bytes().iter().fold(2166136261u32, |h, b| {
+            (h ^ u32::from(*b)).wrapping_mul(16777619)
+        });
+        pads.push(Controller {
+            path,
+            label: format!("{name} · {id:08X}"),
+        });
+    }
+    pads.sort_by(|a, b| a.path.cmp(&b.path));
+    pads.dedup_by(|a, b| a.path == b.path);
+    Ok(pads)
+}
+
+fn single() -> Result<CString> {
+    let mut devices = discover()?;
+    match devices.len() {
+        0 => Err("Подключите Vader 5 Pro кабелем или через USB-приёмник в режиме XInput.".into()),
+        1 => Ok(devices.remove(0).path),
+        _ => Err("Подключено несколько устройств. Выберите геймпад в окне приложения.".into()),
+    }
+}
+
 pub struct Profile {
+    pub path: CString,
     pub lights: [u8; 320],
     pub slot: u8,
     pub bytes: [u8; SIZE],
@@ -20,6 +64,7 @@ pub struct Profile {
 }
 
 struct Pad {
+    path: CString,
     device: HidDevice,
     _lock: File,
     uid: [u8; 13],
@@ -40,16 +85,16 @@ fn report(command: u8, payload: &[u8]) -> [u8; 33] {
 }
 
 impl Pad {
-    fn open() -> Result<Self> {
+    fn open(path: &CStr) -> Result<Self> {
         let mut options = OpenOptions::new();
         options.create(true).truncate(false).write(true);
         #[cfg(windows)]
-        let path = {
+        let lock_path = {
             options.share_mode(0);
             std::env::temp_dir().join("vader5-config.lock")
         };
         #[cfg(target_os = "linux")]
-        let path = {
+        let lock_path = {
             use std::os::unix::fs::OpenOptionsExt;
             options.mode(0o600);
             let dir = std::env::var_os("XDG_RUNTIME_DIR")
@@ -62,26 +107,14 @@ impl Pad {
             dir.join("vader5-config.lock")
         };
         let lock = options
-            .open(path)
+            .open(lock_path)
             .map_err(|e| format!("Не удалось начать сеанс настройки. {e}"))?;
         #[cfg(target_os = "linux")]
         lock.try_lock().map_err(|e| {
             format!("Не удалось занять геймпад. Закройте другое окно настройки. {e}")
         })?;
         let api = HidApi::new().map_err(|e| e.to_string())?;
-        let mut candidates = api.device_list().filter(|d| {
-            d.vendor_id() == 0x37d7
-                && d.product_id() == 0x2401
-                && d.usage_page() == 0xffa0
-                && d.usage() == 1
-        });
-        let info = candidates
-            .next()
-            .ok_or("Подключите Vader 5 Pro кабелем или через USB-приёмник в режиме XInput.")?;
-        if candidates.next().is_some() {
-            return Err("Подключено несколько устройств Flydigi. Оставьте один геймпад.".into());
-        }
-        let device = info.open_device(&api).map_err(|e| {
+        let device = api.open_path(path).map_err(|e| {
             #[cfg(windows)]
             let hint = "Закройте Space Station и повторите.";
             #[cfg(target_os = "linux")]
@@ -89,6 +122,7 @@ impl Pad {
             format!("Не удалось открыть геймпад. {hint} {e}")
         })?;
         let mut pad = Self {
+            path: path.to_owned(),
             device,
             _lock: lock,
             uid: [0; 13],
@@ -211,6 +245,7 @@ impl Pad {
         }
         let lights = self.blob(0xa7, slot)?;
         Ok(Profile {
+            path: self.path.clone(),
             lights,
             slot,
             bytes,
@@ -221,7 +256,11 @@ impl Pad {
 }
 
 pub fn load() -> Result<Profile> {
-    Pad::open()?.profile()
+    load_at(&single()?)
+}
+
+pub fn load_at(path: &CStr) -> Result<Profile> {
+    Pad::open(path)?.profile()
 }
 
 fn can_resume<const N: usize>(
@@ -242,7 +281,7 @@ pub fn save(
     lights: &[u8; 320],
     retry: bool,
 ) -> Result<Profile> {
-    let pad = Pad::open()?;
+    let pad = Pad::open(&original.path)?;
     let current = pad.profile()?;
     if current.uid != original.uid || current.slot != original.slot {
         return Err("Геймпад или профиль изменился. Считайте назначения заново.".into());
@@ -447,7 +486,7 @@ mod tests {
     #[test]
     #[ignore = "requires a connected controller; stages identical settings without committing"]
     fn hardware_combined_staging() -> Result<()> {
-        let pad = Pad::open().unwrap();
+        let pad = Pad::open(&single()?).unwrap();
         let before = pad.profile().unwrap();
         for (cmd, bytes, chunks) in [
             (0xa4, &before.bytes[..], &[2, 3, 11][..]),
